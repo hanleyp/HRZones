@@ -6,7 +6,8 @@ HRZones parses the Health export from your iPhone, matches every heart-rate samp
 
 Built with SwiftUI and Swift Charts. Runs entirely on your Mac. No accounts, no network access, no data leaves your machine.
 
-<!-- Add a screenshot: docs/screenshot.png --> <!-- ![HRZones dashboard](docs/screenshot.png) -->
+<!-- Add a screenshot: docs/screenshot.png -->
+![HRZones dashboard](docs/screenshot.png)
 
 ## Features
 
