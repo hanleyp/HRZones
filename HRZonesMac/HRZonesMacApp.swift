@@ -25,7 +25,7 @@ struct HRZonesMacApp: App {
             ContentView()
                 .environmentObject(dataStore)
                 .environmentObject(zoneStore)
-                .frame(minWidth: 700, minHeight: 640)
+                .frame(minWidth: 700, minHeight: 1095)
         }
         .windowResizability(.contentSize)
     }

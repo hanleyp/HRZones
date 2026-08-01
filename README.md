@@ -2,11 +2,12 @@
 
 **A macOS app that analyzes your Apple Health data and tells you whether your training is actually easy enough.**
 
-HRZones parses the Health export from your iPhone, matches every heart-rate sample to your workouts, and shows how your training time splits across five heart-rate zones — with a focus on the question endurance athletes care about most: *how much of my training is really in Zone 2?*
+HRZones reads your iPhone health data — either the full Apple Health export or a lightweight [Health Auto Export](https://apps.apple.com/us/app/health-auto-export-json-csv/id1115567069) file — matches every heart-rate sample to your workouts, and shows how your training time splits across five heart-rate zones — with a focus on the question endurance athletes care about most: *how much of my training is really in Zone 2?*
 
 Built with SwiftUI and Swift Charts. Runs entirely on your Mac. No accounts, no network access, no data leaves your machine.
 
-<!-- Add a screenshot: docs/screenshot.png --> <!-- ![HRZones dashboard](docs/screenshot.png) -->
+<!-- Add a screenshot: docs/screenshot.png -->
+![HRZones dashboard](docs/screenshot.png)
 
 ## Features
 
@@ -16,6 +17,7 @@ Built with SwiftUI and Swift Charts. Runs entirely on your Mac. No accounts, no 
 - **Zone distribution** — percentage and total time per zone
 - **Zone 1 handling** — by default, Zone 1 (warmup/cooldown/recovery) is treated as neutral and excluded from the target math, matching how 80/20 training is usually interpreted; a checkbox switches to the strict all-time metric
 - **Fully editable zones** — Apple's Health export does *not* include the zone boundaries configured on your Watch, so HRZones estimates them from max HR (220 − age, read from your export) and lets you override every boundary manually, with gap/overlap validation
+- **Two data paths** — reads the full Apple Health export (`export.zip`/`export.xml`) *or* small JSON/CSV files from the Health Auto Export app, which can refresh your data automatically on a schedule (see [docs/HEALTH_AUTO_EXPORT_SETUP.md](docs/HEALTH_AUTO_EXPORT_SETUP.md))
 - **Fast** — a byte-level streaming parser chews through multi-gigabyte `export.xml` files in seconds (10–30× faster than Foundation's `XMLParser`), results are cached, and the app remembers your last export and reloads it automatically at launch
 
 ## Requirements
@@ -31,7 +33,8 @@ No Apple Developer Program membership is needed — the app signs with "Sign to 
 1. Clone the repo:
 
    ```bash
-   git clone https://github.com/hanleyp/HRZones.gitcd HRZones
+   git clone https://github.com/hanleyp/HRZones.git
+   cd HRZones
    ```
 
 2. Open `HRZonesMac.xcodeproj` in Xcode.
@@ -57,27 +60,26 @@ No Apple Developer Program membership is needed — the app signs with "Sign to 
 
 ## Using the app
 
-### 1. Export your Health data (on the iPhone)
+### 1. Get your data out of the iPhone — two options
 
-Health app → tap your **profile picture** (top right) → **Export All Health Data**. This produces `export.zip` — it can take a few minutes and be large (0.5–2 GB is normal).
+**Option A — Health Auto Export (recommended, fastest).** The [Health Auto Export – JSON+CSV](https://apps.apple.com/us/app/health-auto-export-json-csv/id1115567069) app exports just the last 31 days of heart-rate data (with workouts) as a small JSON or CSV file — seconds instead of minutes, a few MB instead of gigabytes — and can write it to an iCloud Drive folder automatically on a schedule, so your Mac always has fresh data with zero taps. Full configuration walkthrough: **[docs/HEALTH_AUTO_EXPORT_SETUP.md](docs/HEALTH_AUTO_EXPORT_SETUP.md)**. In short: enable the Heart Rate metric + Export Workouts, JSON format, last 31 days, Minutes aggregation, destination iCloud Drive.
 
-### 2. Get it to the Mac
+**Option B — the full Apple Health export (built-in, free).** Health app → tap your **profile picture** (top right) → **Export All Health Data**. This produces `export.zip` — it can take a few minutes and be large (0.5–2 GB is normal). AirDrop it to your Mac or save it to iCloud Drive.
 
-AirDrop the zip to your Mac, or save it to iCloud Drive.
+### 2. Open it in HRZones
 
-### 3. Open it in HRZones
+Click **Open export…** or drag any of these onto the window:
 
-Click **Open export.zip / folder…** or drag any of these onto the window:
-
+- a Health Auto Export `.json` or `.csv` file — or the iCloud folder it lives in (the app always loads the freshest export inside a folder, which pairs perfectly with scheduled automations)
 - `export.zip` (the app unzips it for you)
 - `export.xml`
 - the unzipped `apple_health_export` folder
 
 The app remembers whatever you opened and reloads it automatically next launch. Parsed results are cached against the file's size and modification date, so reopening the same export is instant; a new export invalidates the cache and re-parses.
 
-**Tip — lowest-friction refresh loop:** unzip once, keep the `apple_health_export` folder somewhere stable, and open it once. From then on, just replace the `export.xml` inside that folder with each new export — the app auto-loads the folder at launch and notices the file changed.
+**Tip — lowest-friction refresh loop:** with Option A, schedule the export and open the iCloud folder in HRZones once; every launch then shows current data automatically. With Option B, keep the unzipped `apple_health_export` folder somewhere stable and replace the `export.xml` inside it with each new export.
 
-### 4. Set your zones
+### 3. Set your zones
 
 Click the sliders icon to open the zone editor:
 
@@ -86,7 +88,7 @@ Click the sliders icon to open the zone editor:
 - The editor warns about gaps and overlaps between zones.
 - The **weekly Zone 2 goal** range (default 150–180 min) is editable here too.
 
-### 5. Read the dashboard
+### 4. Read the dashboard
 
 - **Week / Month** toggle switches the analysis window (anchored to the export's timestamp, so a few-days-old export still computes "past week" correctly).
 - **Zone 2 Target ring** — Zone 2 as a share of Zone 2–5 time by default. The checkbox underneath switches to counting Zone 1 in the denominator.
@@ -97,6 +99,7 @@ Click the sliders icon to open the zone editor:
 ## How the numbers are computed
 
 - Only heart rate recorded **during workouts** counts. All-day background HR is excluded.
+- If an export contains no workout entries (e.g., a Health Auto Export CSV, or workouts toggled off), HRZones infers workout sessions from heart-rate sampling density — recorded workouts sample every few seconds, background monitoring only every few minutes, so sessions ≥ 10 minutes stand out unambiguously.
 - Each HR sample "owns" the time until the next sample, capped at 60 seconds so sensor dropouts don't inflate a zone; the last sample owns time to the workout's end.
 - Samples that fall in a gap between zones (possible after manual edits) are not counted — the editor flags gaps so you can close them.
 - The parser keeps only the last 31 days of samples in memory, which is what makes multi-GB exports fast and light.
@@ -113,7 +116,7 @@ Your Health export contains sensitive personal data. HRZones:
 - stores only derived results (heart-rate timestamps/BPM from the last 31 days and workout intervals) in a local cache under `~/Library/Application Support/`
 - keeps a security-scoped bookmark to your export's location so it can reload it at launch
 
-Delete the cache and bookmark at any time by removing the app's Application Support folder and its `UserDefaults` domain. Be mindful not to commit your `export.zip`/`export.xml` to any repository.
+Delete the cache and bookmark at any time by removing the app's Application Support folder and its `UserDefaults` domain. Be mindful not to commit your `export.zip`/`export.xml` or Health Auto Export `.json`/`.csv` files to any repository.
 
 ## Project structure
 
@@ -124,12 +127,14 @@ HRZonesMac/
 ├── ZoneEditorView.swift      # Zone boundary + goal editor with validation
 ├── ZoneModels.swift          # Zone definitions, defaults, persistence
 └── HealthExportStore.swift   # Zip/folder handling, byte-level XML parser,
-                              # caching, bookmark restore, time-in-zone math
+                              # Health Auto Export JSON/CSV parsers, workout
+                              # inference, caching, bookmark restore,
+                              # time-in-zone math
 ```
 
 ## Limitations
 
-- The export is a snapshot — re-export from the phone to refresh data.
+- An export is a snapshot — re-export from the phone to refresh data (or let a scheduled Health Auto Export automation do it for you).
 - HR-based zones drift from power-based zones (e.g., Peloton Power Zones): holding steady Zone 2 *watts*, your heart rate climbs late in a ride (cardiac drift), so HR-Zone-2 time will read slightly lower than power-Zone-2 effort. This is physiology, not a bug.
 - The 220 − age max-HR formula is a population estimate; if you know your actual max HR or lactate threshold, set the zones manually.
 - Analysis covers the last 31 days only, by design.
@@ -140,4 +145,4 @@ HRZones is a hobby project for visualizing your own training data. It is not a m
 
 ## License
 
-See [LICENSE](https://claude.ai/chat/LICENSE).
+See [LICENSE](LICENSE).

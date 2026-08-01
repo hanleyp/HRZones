@@ -96,7 +96,7 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $showingImporter,
-            allowedContentTypes: [.zip, .xml, .folder],
+            allowedContentTypes: [.zip, .xml, .folder, .json, .commaSeparatedText],
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
@@ -408,15 +408,15 @@ struct ContentView: View {
                 "Open a Health export",
                 systemImage: "heart.text.square",
                 description: Text("""
-                On your iPhone: Health app → tap your profile picture → \
-                Export All Health Data, then AirDrop the export.zip here. \
-                Open the zip, the export.xml, or the unzipped \
-                apple_health_export folder below — or drag any of them onto \
-                this window. The app remembers your last source and reloads \
-                it automatically next launch.
+                Fastest: use the Health Auto Export app on iPhone to export \
+                Heart Rate (JSON or CSV) to an iCloud Drive folder, then open \
+                that file or folder here. Or use the full export: Health app \
+                → profile picture → Export All Health Data → AirDrop \
+                export.zip. Open or drag any of them onto this window — the \
+                app remembers your last source and reloads it at launch.
                 """)
             )
-            Button("Open export.zip / folder…") { showingImporter = true }
+            Button("Open export…") { showingImporter = true }
                 .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity, minHeight: 320)

@@ -136,9 +136,18 @@ final class HealthExportStore: ObservableObject {
                     Task { @MainActor in self.state = .loading("Loading cached results…") }
                     result = cached
                 } else {
-                    result = try Self.parseFast(xmlURL: xmlURL) { fractionDone in
-                        Task { @MainActor in
-                            self.state = .loading("Parsing export… \(Int(fractionDone * 100))%")
+                    switch xmlURL.pathExtension.lowercased() {
+                    case "json":
+                        Task { @MainActor in self.state = .loading("Reading Health Auto Export JSON…") }
+                        result = try Self.parseHealthAutoExportJSON(url: xmlURL)
+                    case "csv":
+                        Task { @MainActor in self.state = .loading("Reading Health Auto Export CSV…") }
+                        result = try Self.parseHealthAutoExportCSV(url: xmlURL)
+                    default:
+                        result = try Self.parseFast(xmlURL: xmlURL) { fractionDone in
+                            Task { @MainActor in
+                                self.state = .loading("Parsing export… \(Int(fractionDone * 100))%")
+                            }
                         }
                     }
                     Self.saveCache(result, for: xmlURL)
@@ -166,20 +175,34 @@ final class HealthExportStore: ObservableObject {
         FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
 
         if isDirectory.boolValue {
-            let candidates = [
+            var candidates = [
                 url.appendingPathComponent("export.xml"),
                 url.appendingPathComponent("apple_health_export/export.xml"),
-            ]
-            if let found = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
-                return found
+            ].filter { FileManager.default.fileExists(atPath: $0.path) }
+
+            // Health Auto Export writes timestamped .json/.csv files —
+            // include any found at the folder's top level.
+            if let entries = try? FileManager.default.contentsOfDirectory(
+                at: url, includingPropertiesForKeys: [.contentModificationDateKey]) {
+                candidates += entries.filter {
+                    ["json", "csv"].contains($0.pathExtension.lowercased())
+                }
             }
-            throw NSError(domain: "HRZones", code: 3, userInfo: [
-                NSLocalizedDescriptionKey: "export.xml not found in that folder. Drop the apple_health_export folder (or export.xml itself)."
-            ])
+            guard !candidates.isEmpty else {
+                throw NSError(domain: "HRZones", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "No export found in that folder. Expected a Health Auto Export .json/.csv, export.xml, or an apple_health_export folder."
+                ])
+            }
+            // Prefer whichever data file is freshest.
+            func modified(_ u: URL) -> TimeInterval {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
+                return (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            }
+            return candidates.max(by: { modified($0) < modified($1) })!
         }
 
         switch url.pathExtension.lowercased() {
-        case "xml":
+        case "xml", "json", "csv":
             return url
         case "zip":
             status("Unzipping \(url.lastPathComponent)…")
@@ -211,7 +234,7 @@ final class HealthExportStore: ObservableObject {
             ])
         default:
             throw NSError(domain: "HRZones", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Please choose export.zip, export.xml, or the apple_health_export folder."
+                NSLocalizedDescriptionKey: "Please choose a Health Auto Export .json/.csv file, export.zip, export.xml, or the apple_health_export folder."
             ])
         }
     }
@@ -373,6 +396,231 @@ final class HealthExportStore: ObservableObject {
         if let data = try? JSONEncoder().encode(payload) {
             try? data.write(to: cacheURL, options: .atomic)
         }
+    }
+
+    // MARK: Health Auto Export (JSON + CSV)
+
+    // Parses exports from the "Health Auto Export - JSON+CSV" iOS app
+    // (healthyapps.dev). JSON schema per the developer's documentation:
+    //   { "data": { "metrics": [ { "name": "heart_rate", "units": …,
+    //       "data": [ { "date": "yyyy-MM-dd HH:mm:ss Z",
+    //                   "Min": n, "Avg": n, "Max": n } ] } ],
+    //     "workouts": [ { "name": …, "start": …, "end": …,
+    //                     "heartRateData": [ { "date": …, "Avg"/"qty": n } ] } ] } }
+    // Field casing and value keys vary across app/API versions, so lookups
+    // are tolerant (Avg/avg/qty), and dates accept both the space-separated
+    // and ISO 8601 forms.
+
+    nonisolated static func parseHealthAutoExportJSON(url: URL) throws -> ParseResult {
+        let raw: Data
+        do { raw = try Data(contentsOf: url) } catch {
+            throw NSError(domain: "HRZones", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "Couldn't read \(url.lastPathComponent)."
+            ])
+        }
+        guard let rootAny = try? JSONSerialization.jsonObject(with: raw),
+              let root = rootAny as? [String: Any] else {
+            throw NSError(domain: "HRZones", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "\(url.lastPathComponent) isn't valid JSON."
+            ])
+        }
+        let container = (root["data"] as? [String: Any]) ?? root
+        let cutoff = Date().addingTimeInterval(-31 * 86400)
+
+        func parseDate(_ any: Any?) -> Date? {
+            guard let s = any as? String else { return nil }
+            return FastHealthDate.parse(s)
+        }
+        func number(_ any: Any?) -> Double? {
+            if let n = any as? Double { return n }
+            if let n = any as? Int { return Double(n) }
+            if let n = any as? NSNumber { return n.doubleValue }
+            return nil
+        }
+        /// Heart-rate entries carry Min/Avg/Max; other variants use qty.
+        func hrValue(_ entry: [String: Any]) -> Double? {
+            for key in ["Avg", "avg", "qty", "value"] {
+                if let v = number(entry[key]) { return v }
+            }
+            return nil
+        }
+        /// Matches "heart_rate" / "Heart Rate" while excluding resting,
+        /// walking-average, variability, and recovery metrics.
+        func isInstantHeartRateMetric(_ name: String) -> Bool {
+            let normalized = name.lowercased()
+                .replacingOccurrences(of: "_", with: "")
+                .replacingOccurrences(of: " ", with: "")
+            guard normalized.contains("heartrate") else { return false }
+            for excluded in ["resting", "walking", "variability", "recovery", "notification"] {
+                if normalized.contains(excluded) { return false }
+            }
+            return true
+        }
+
+        var samples: [HRSample] = []
+        var workouts: [WorkoutRecord] = []
+
+        if let metrics = container["metrics"] as? [[String: Any]] {
+            for metric in metrics {
+                guard isInstantHeartRateMetric(metric["name"] as? String ?? "") else { continue }
+                for entry in metric["data"] as? [[String: Any]] ?? [] {
+                    guard let date = parseDate(entry["date"]), date >= cutoff,
+                          let bpm = hrValue(entry) else { continue }
+                    samples.append(HRSample(date: date, bpm: bpm))
+                }
+            }
+        }
+
+        if let workoutArray = container["workouts"] as? [[String: Any]] {
+            for w in workoutArray {
+                guard let start = parseDate(w["start"]),
+                      let end = parseDate(w["end"]),
+                      end >= cutoff, end > start else { continue }
+                let name = (w["name"] as? String) ?? "Workout"
+                workouts.append(WorkoutRecord(start: start, end: end, activity: name))
+
+                // Workouts carry their own per-sample heart-rate arrays —
+                // the highest-resolution data in the export.
+                for key in ["heartRateData", "heartRateRecovery"] where key == "heartRateData" {
+                    for entry in w[key] as? [[String: Any]] ?? [] {
+                        guard let date = parseDate(entry["date"]), date >= cutoff,
+                              let bpm = hrValue(entry) else { continue }
+                        samples.append(HRSample(date: date, bpm: bpm))
+                    }
+                }
+            }
+        }
+
+        return try finalizeHealthAutoExport(samples: samples, workouts: workouts, source: url)
+    }
+
+    /// Tolerant CSV reader for Health Auto Export heart-rate CSVs: finds
+    /// the date column and the best value column (Avg preferred) from the
+    /// header row, whatever the exact header wording.
+    nonisolated static func parseHealthAutoExportCSV(url: URL) throws -> ParseResult {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            throw NSError(domain: "HRZones", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "Couldn't read \(url.lastPathComponent)."
+            ])
+        }
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        guard lines.count >= 2 else {
+            throw NSError(domain: "HRZones", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "\(url.lastPathComponent) doesn't look like a Health Auto Export CSV."
+            ])
+        }
+
+        func cells(_ line: String) -> [String] {
+            line.split(separator: ",", omittingEmptySubsequences: false).map {
+                $0.trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            }
+        }
+
+        let header = cells(lines[0]).map { $0.lowercased() }
+        guard let dateCol = header.firstIndex(where: { $0.contains("date") }) else {
+            throw NSError(domain: "HRZones", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "No date column found in \(url.lastPathComponent). Export the Heart Rate metric as CSV from Health Auto Export."
+            ])
+        }
+        let valueCol = header.firstIndex(where: { $0.contains("avg") })
+            ?? header.firstIndex(where: { $0.contains("qty") })
+            ?? header.firstIndex(where: { $0.contains("heart rate") && !$0.contains("date") })
+            ?? (dateCol == 0 ? 1 : 0)
+
+        let cutoff = Date().addingTimeInterval(-31 * 86400)
+        var samples: [HRSample] = []
+        for line in lines.dropFirst() {
+            let row = cells(line)
+            guard row.count > max(dateCol, valueCol),
+                  let date = FastHealthDate.parse(row[dateCol]), date >= cutoff,
+                  let bpm = lenientDouble(row[valueCol]) else { continue }
+            samples.append(HRSample(date: date, bpm: bpm))
+        }
+
+        return try finalizeHealthAutoExport(samples: samples, workouts: [], source: url)
+    }
+
+    /// Shared tail: dedupe/sort samples, infer workouts when the export
+    /// didn't include any, and anchor the analysis window to the data.
+    nonisolated private static func finalizeHealthAutoExport(
+        samples: [HRSample], workouts: [WorkoutRecord], source: URL
+    ) throws -> ParseResult {
+        guard !samples.isEmpty else {
+            throw NSError(domain: "HRZones", code: 7, userInfo: [
+                NSLocalizedDescriptionKey: "No heart-rate data found in \(source.lastPathComponent). In Health Auto Export, enable the Heart Rate metric (and Export Workouts), then export again."
+            ])
+        }
+        // Dedupe by whole-second timestamp (metrics + workout HR overlap).
+        var byKey: [Int64: Double] = [:]
+        for s in samples {
+            byKey[Int64(s.date.timeIntervalSince1970.rounded())] = s.bpm
+        }
+        let deduped = byKey.keys.sorted().map {
+            HRSample(date: Date(timeIntervalSince1970: Double($0)), bpm: byKey[$0]!)
+        }
+
+        var finalWorkouts = workouts
+        if finalWorkouts.isEmpty {
+            finalWorkouts = inferWorkouts(from: deduped)
+        }
+        let newestWorkoutEnd = finalWorkouts.map(\.end).max()
+        let anchor = max(deduped.last!.date, newestWorkoutEnd ?? .distantPast)
+
+        return ParseResult(samples: deduped, workouts: finalWorkouts,
+                           exportDate: anchor, age: nil)
+    }
+
+    /// Parses "67", "67.5", or "67,5" (decimal-comma locales).
+    nonisolated static func lenientDouble(_ s: String) -> Double? {
+        let numeric = s.prefix { $0.isNumber || $0 == "." || $0 == "," }
+        guard !numeric.isEmpty else { return nil }
+        if numeric.contains(","), !numeric.contains(".") {
+            return Double(numeric.replacingOccurrences(of: ",", with: "."))
+        }
+        if numeric.contains(",") {
+            return Double(numeric.replacingOccurrences(of: ",", with: ""))
+        }
+        return Double(numeric)
+    }
+
+    /// Clusters densely-sampled heart-rate stretches into workout sessions
+    /// for exports that don't include workouts. Thresholds accommodate
+    /// per-minute aggregated data: a session continues while consecutive
+    /// samples are ≤ 150 s apart, and counts as a workout if it lasts
+    /// ≥ 10 min with ≥ 8 samples averaging ≤ 75 s apart — far denser than
+    /// background sampling (every 3–10 min), so false positives are rare.
+    nonisolated static func inferWorkouts(
+        from sortedSamples: [HRSample],
+        maxGap: TimeInterval = 150,
+        minDuration: TimeInterval = 10 * 60,
+        minSamples: Int = 8,
+        maxAverageCadence: TimeInterval = 75
+    ) -> [WorkoutRecord] {
+        guard sortedSamples.count > 1 else { return [] }
+        var workouts: [WorkoutRecord] = []
+        var clusterStart = 0
+
+        func closeCluster(endIndex: Int) {
+            let count = endIndex - clusterStart + 1
+            guard count >= minSamples else { return }
+            let start = sortedSamples[clusterStart].date
+            let end = sortedSamples[endIndex].date
+            let duration = end.timeIntervalSince(start)
+            guard duration >= minDuration,
+                  duration / Double(count) <= maxAverageCadence else { return }
+            workouts.append(WorkoutRecord(start: start, end: end, activity: "Workout"))
+        }
+
+        for i in 1..<sortedSamples.count {
+            let gap = sortedSamples[i].date.timeIntervalSince(sortedSamples[i - 1].date)
+            if gap > maxGap {
+                closeCluster(endIndex: i - 1)
+                clusterStart = i
+            }
+        }
+        closeCluster(endIndex: sortedSamples.count - 1)
+        return workouts
     }
 
     // MARK: Fast byte-level parser
@@ -706,8 +954,11 @@ enum FastHealthDate {
         }
     }
 
+    /// Handles the Apple/Health Auto Export format "2026-07-30 07:12:34 -0700"
+    /// plus ISO 8601 variants "2026-07-30T07:12:34-07:00" / "…Z", with
+    /// optional fractional seconds.
     static func parse(bytes p: UnsafePointer<UInt8>, count: Int) -> Date? {
-        guard count >= 25 else { return nil }
+        guard count >= 19 else { return nil }
 
         func digit(_ i: Int) -> Int? {
             let b = p[i]
@@ -715,7 +966,7 @@ enum FastHealthDate {
             return Int(b - 48)
         }
         func int2(_ i: Int) -> Int? {
-            guard let a = digit(i), let b = digit(i + 1) else { return nil }
+            guard i + 1 < count, let a = digit(i), let b = digit(i + 1) else { return nil }
             return a * 10 + b
         }
         func int4(_ i: Int) -> Int? {
@@ -727,10 +978,33 @@ enum FastHealthDate {
               let hour = int2(11), let minute = int2(14), let second = int2(17)
         else { return nil }
 
-        let signByte = p[20]
-        guard signByte == 43 || signByte == 45,
-              let tzH = int2(21), let tzM = int2(23) else { return nil }
-        let tzSeconds = (tzH * 3600 + tzM * 60) * (signByte == 45 ? -1 : 1)
+        // Walk past optional fractional seconds and the optional space
+        // before the timezone, then read the offset ("Z", "±HHMM", "±HH:MM").
+        var i = 19
+        if i < count, p[i] == 0x2E /* '.' */ {
+            i += 1
+            while i < count, p[i] >= 48, p[i] <= 57 { i += 1 }
+        }
+        if i < count, p[i] == 0x20 /* ' ' */ { i += 1 }
+
+        var tzSeconds = 0
+        if i < count {
+            let b = p[i]
+            if b == 0x5A /* 'Z' */ {
+                tzSeconds = 0
+            } else if b == 43 /* '+' */ || b == 45 /* '-' */ {
+                let sign = (b == 45) ? -1 : 1
+                i += 1
+                guard let tzH = int2(i) else { return nil }
+                i += 2
+                if i < count, p[i] == 0x3A /* ':' */ { i += 1 }
+                guard let tzM = int2(i) else { return nil }
+                tzSeconds = sign * (tzH * 3600 + tzM * 60)
+            } else {
+                return nil
+            }
+        }
+        // No timezone at all → treated as UTC.
 
         let days = daysFromCivil(year: year, month: month, day: day)
         let epoch = TimeInterval(days) * 86400
