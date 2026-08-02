@@ -318,7 +318,7 @@ struct ContentView: View {
             Text("Daily Time in Zones").font(.headline)
             Chart {
                 ForEach(store.dailyBreakdowns) { day in
-                    ForEach(zoneStore.zones) { zone in
+                    ForEach(chartZones) { zone in
                         if let secs = day.secondsPerZone[zone.id], secs > 0 {
                             BarMark(
                                 x: .value("Day", day.day, unit: .day),
@@ -329,7 +329,10 @@ struct ContentView: View {
                     }
                 }
             }
-            .chartForegroundStyleScale(zoneColorScale)
+            .chartForegroundStyleScale(
+                domain: chartZones.map(\.label),
+                range: chartZones.map(\.color)
+            )
             .chartXAxis {
                 AxisMarks(values: .stride(by: .day, count: range == .week ? 1 : 5)) { _ in
                     AxisGridLine()
@@ -343,14 +346,11 @@ struct ContentView: View {
         .background(cardBackground)
     }
 
-    private var zoneColorScale: KeyValuePairs<String, Color> {
-        [
-            "Zone 1": zoneStore.zones[0].color,
-            "Zone 2": zoneStore.zones[1].color,
-            "Zone 3": zoneStore.zones[2].color,
-            "Zone 4": zoneStore.zones[3].color,
-            "Zone 5": zoneStore.zones[4].color,
-        ]
+    /// Zones drawn in the daily chart: Zone 1 is hidden while it's
+    /// excluded from the target, keeping the chart and legend consistent
+    /// with the rest of the dashboard.
+    private var chartZones: [HRZone] {
+        includeZone1 ? zoneStore.zones : zoneStore.zones.filter { $0.id != 1 }
     }
 
     // MARK: Distribution
